@@ -5,8 +5,8 @@ Wacs-Import.ps1
 
 Default behaviors:
 - Scans <ShareRoot>\Certs for newest PFX:
-    - Prefers "<BaseName>*.pfx"
-    - Falls back to newest "*.pfx"
+    - Prefers "<BaseName>*.pfx", "_.<BaseName>*.pfx", and falls back to newest "*.pfx"
+    - Retries remaining candidate PFX files if the primary choice fails password import
 - Uses <ShareRoot>\export-secrets.json by default.
   Also supports:
     - import.secrets.json  (array of { Key, Secret })
@@ -17,24 +17,7 @@ Default behaviors:
     - Updates TlsCertificateName ONLY if different (idempotent)
 - Receive Connector(s): update TLS name ONLY if different
 - Cleanup: removes older Exchange certs safely (normalizes wildcard SANs)
-
-CHANGES IN THIS BUILD
----------------------
-- Removed the "skip TLS update when any source is missing cert" guard.
-  We now proceed with TLS updates regardless, and log missing sources.
-- Added diagnostics (-Diagnose), transcript options, and richer debug logging.
-- Added pre-flight access checks and post-change verification.
-
-SCHEDULED TASK
---------------
-- Run as a domain service account (local admin on all Exchange servers; Exchange RBAC rights).
-- Ensure you start in an EMS session (or the script loads EMS; see Ensure-ExchangePSSession).
-#>
-
-[CmdletBinding()]
-param(
-  [Parameter(Mandatory=$true)][string]$ShareRoot = "\\NETWORKDRIVE\Share",
-  [Parameter(Mandatory=$true)][string]$BaseName   = "example.com",
+#>  [Parameter(Mandatory=$true)][string]$BaseName   = "example.com",
 
   [string]$PfxOverridePath,
   [string]$SecretsPath,                              # default to export-secrets.json
