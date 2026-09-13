@@ -1,26 +1,13 @@
 <#
-Wacs-Import.ps1
-- Latest cert discovery, hybrid-aware, idempotent connector updates
-- Deploys/imports to ALL Send Connector SourceTransportServers using Exchange -Server (no nested WinRM)
-
-Default behaviors:
-- Scans <ShareRoot>\Certs for newest PFX:
-    - Prefers "<BaseName>*.pfx", "_.<BaseName>*.pfx", and falls back to newest "*.pfx"
-    - Retries remaining candidate PFX files if the primary choice fails password import
-- Uses <ShareRoot>\export-secrets.json by default.
-  Also supports:
-    - import.secrets.json  (array of { Key, Secret })
-    - secrets.json         (object legacy styles)
-- Imports cert locally, enables IIS,SMTP
-- For each Send Connector:
-    - Ensures cert is present + SMTP enabled on every SourceTransportServer (via Exchange -Server)
-    - Updates TlsCertificateName ONLY if different (idempotent)
-- Receive Connector(s): update TLS name ONLY if different
-- Cleanup: removes older Exchange certs safely (normalizes wildcard SANs)
-#>  [Parameter(Mandatory=$true)][string]$BaseName   = "example.com",
-
+.SYNOPSIS
+  Wacs-Import.ps1 - Hybrid-aware certificate deployment script for Exchange.
+#>
+[CmdletBinding()]
+param(
+  [Parameter(Mandatory=$true)][string]$BaseName = "example.com",
+  [string]$ShareRoot = "C:\CentralSSL",
   [string]$PfxOverridePath,
-  [string]$SecretsPath,                              # default to export-secrets.json
+  [string]$SecretsPath,
   [string]$Services = "IIS,SMTP",
 
   [switch]$NoHybridUpdates,
@@ -29,14 +16,12 @@ Default behaviors:
   [string[]]$SendConnectorExact,
   [switch]$AllSendConnectors,
 
-  [string]$ReceiveConnectorPattern,                  # default "*Default Frontend <server>*"
+  [string]$ReceiveConnectorPattern,
 
   [switch]$NoCleanup,
   [switch]$RestartIIS,
 
   [switch]$DebugOn,
-
-  # --- New diagnostics / logging ---
   [switch]$Diagnose,
   [switch]$StartTranscript,
   [string]$TranscriptPath
@@ -44,11 +29,11 @@ Default behaviors:
 
 # ------------- Logging & safety -------------
 if ($DebugOn) {
-  $VerbosePreference   = 'Continue'
-  $DebugPreference     = 'Continue'
+  $VerbosePreference     = 'Continue'
+  $DebugPreference       = 'Continue'
   $InformationPreference = 'Continue'
 }
-$ErrorActionPreference = 'Continue'  # We catch & log at key spots.
+$ErrorActionPreference = 'Continue'
 
 function Write-Log {
   param([string]$Message,[ValidateSet('INFO','WARN','ERROR','DEBUG','DIAG')][string]$Level='INFO')
@@ -102,9 +87,10 @@ function Load-Secrets {
     if (-not $raw -or -not $raw.Trim()) { return $null }
     return $raw | ConvertFrom-Json -ErrorAction Stop
   } catch {
-    throw "Failed to parse secrets JSON at '$Path' $($_.Exception.Message)"
+    throw "Failed to parse secrets JSON at '$Path': $($_.Exception.Message)"
   }
 }
+
 function Resolve-PfxPassword {
   param([object]$Secrets,[string]$BaseName)
   if ($null -eq $Secrets) { return $null }
@@ -120,7 +106,6 @@ function Resolve-PfxPassword {
     if ($p) { return $p.Value } else { return $null }
   }
 
-  # Array of { Key, Secret }
   if ($Secrets -is [System.Collections.IEnumerable] -and -not ($Secrets -is [System.Collections.IDictionary])) {
     $arr = @($Secrets)
     $match = $arr | Where-Object { HasProp $_ 'Key' -and (GetProp $_ 'Key') -ieq $BaseName } | Select-Object -First 1
@@ -132,7 +117,6 @@ function Resolve-PfxPassword {
     return $null
   }
 
-  # Object legacy styles
   if (HasProp $Secrets $BaseName) {
     $node = GetProp $Secrets $BaseName
     if ($node -is [string]) { return [string]$node }
@@ -154,7 +138,6 @@ function Resolve-PfxPassword {
 
 # ------------- Exchange helpers -------------
 function Ensure-ExchangePSSession {
-  # If you run from the Exchange Management Shell, this is a no-op.
   if (Get-Command Import-ExchangeCertificate -ErrorAction SilentlyContinue) { return }
   $ps1 = $env:ExchangeInstallPath
   if ($ps1) { $ps1 = Join-Path $ps1 "bin\RemoteExchange.ps1" }
@@ -171,9 +154,9 @@ function Ensure-ExchangePSSession {
 }
 
 function Get-CertTlsName([System.Security.Cryptography.X509Certificates.X509Certificate2]$Cert) {
-  # Build <I>Issuer<S>Subject string for -TlsCertificateName on Hybrid/Connectors
   return ("<I>{0}<S>{1}" -f $Cert.Issuer, $Cert.Subject)
 }
+
 function Get-CN([string]$Subject) {
   ($Subject -split ',') | Where-Object { $_ -like 'CN=*' } |
     ForEach-Object { $_.Split('=')[1].Trim() } | Select-Object -First 1
@@ -212,8 +195,13 @@ function Ensure-CertOnServerExchange {
     [switch]$EnableIIS
   )
   try {
-    # Import to target server via Exchange cmdlets (no PS remoting)
-    $imported = Import-ExchangeCertificate -Server $Server -FileData $PfxBytes -Password $SecPassword -PrivateKeyExportable:$true -ErrorAction Stop
+    # If running locally, omit -Server parameter for speed and reliability
+    $imported = if ($Server -ieq $env:COMPUTERNAME -or $Server -ieq 'localhost') {
+      Import-ExchangeCertificate -FileData $PfxBytes -Password $SecPassword -PrivateKeyExportable:$true -ErrorAction Stop
+    } else {
+      Import-ExchangeCertificate -Server $Server -FileData $PfxBytes -Password $SecPassword -PrivateKeyExportable:$true -ErrorAction Stop
+    }
+
     $thumbLocal = $null
     if ($imported -and $imported.Thumbprint) {
       $thumbLocal = $imported.Thumbprint
@@ -243,60 +231,87 @@ try {
 
   $certsDir = Join-Path $ShareRoot 'Certs'
 
-  # Default secrets path preference
   if (-not $SecretsPath -or -not $SecretsPath.Trim()) {
-    $candidate1 = Join-Path $ShareRoot "export-secrets.json"     # preferred
-    $candidate2 = Join-Path $ShareRoot "import.secrets.json"     # legacy (array-based)
-    $candidate3 = Join-Path $ShareRoot "secrets.json"            # legacy (object-based)
+    $candidate1 = Join-Path $ShareRoot "export-secrets.json"
+    $candidate2 = Join-Path $ShareRoot "import.secrets.json"
+    $candidate3 = Join-Path $ShareRoot "secrets.json"
     if     (Test-Path -LiteralPath $candidate1) { $SecretsPath = $candidate1 }
     elseif (Test-Path -LiteralPath $candidate2) { $SecretsPath = $candidate2 }
     else                                        { $SecretsPath = $candidate3 }
   }
 
-  # Choose PFX (override > newest BaseName*.pfx > newest *.pfx)
+  # Multi-pattern matching for simple-acme
   if ($PfxOverridePath) {
-    $pfxPath = $PfxOverridePath
-    Write-Log "Override path specified: using $pfxPath"
+    if (-not (Test-Path -LiteralPath $PfxOverridePath)) { throw "PFX override file missing: $PfxOverridePath" }
+    $candidateFiles = @(Get-Item -LiteralPath $PfxOverridePath -ErrorAction Stop)
+    Write-Log "Override path specified: using $PfxOverridePath"
   } else {
     if (-not (Test-Path -LiteralPath $certsDir)) { throw "Certs directory not found: $certsDir" }
     Write-Log "Searching for latest PFX in: $certsDir"
-    $files = Get-ChildItem -Path $certsDir -Filter "$BaseName*.pfx" -File -ErrorAction SilentlyContinue |
-             Sort-Object LastWriteTime -Descending
-    if (-not $files -or $files.Count -eq 0) {
-      Write-Log "No PFX matched '$BaseName*.pfx'. Falling back to newest '*.pfx'." "WARN"
-      $files = Get-ChildItem -Path $certsDir -Filter "*.pfx" -File -ErrorAction SilentlyContinue |
-               Sort-Object LastWriteTime -Descending
+    
+    $patterns = @(
+      "$BaseName*.pfx",
+      "_.$BaseName*.pfx",
+      "*$BaseName*.pfx",
+      "*.pfx"
+    )
+
+    $candidateFiles = @()
+    foreach ($pat in $patterns) {
+      $found = Get-ChildItem -Path $certsDir -Filter $pat -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending
+      if ($found) {
+        $candidateFiles += $found
+      }
     }
-    if (-not $files -or $files.Count -eq 0) { throw "No PFX files found under $certsDir" }
-    $pfxPath = $files[0].FullName
-    Write-Log "Latest PFX selected: $pfxPath"
+    $candidateFiles = @($candidateFiles | Select-Object -Unique FullName)
   }
 
-  # Receive connector default
-  if (-not $ReceiveConnectorPattern -or -not $ReceiveConnectorPattern.Trim()) {
-    $ReceiveConnectorPattern = "*Default Frontend $(hostname)*"
+  if (-not $candidateFiles -or $candidateFiles.Count -eq 0) {
+    throw "No candidate PFX files found under $certsDir matching '$BaseName'"
   }
-
-  Write-Log "PFX path:  $pfxPath"
-  Write-Log "Secrets:   $SecretsPath"
-
-  if (-not (Test-Path -LiteralPath $pfxPath)) { throw "PFX not found at $pfxPath" }
 
   # Resolve password
   $secrets = Load-Secrets -Path $SecretsPath
   $pfxPw   = Resolve-PfxPassword -Secrets $secrets -BaseName $BaseName
   if (-not $pfxPw) { throw "No PFX password found. Ensure $SecretsPath contains Key='$BaseName' or Key='default'." }
+  $sec = ConvertTo-SecureString -String $pfxPw -AsPlainText -Force
 
-  # Load PFX bytes + metadata
-  $bytes = [System.IO.File]::ReadAllBytes($pfxPath)
-  $sec   = ConvertTo-SecureString -String $pfxPw -AsPlainText -Force
-  $x509  = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2
-  $x509.Import($bytes, $sec, [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::DefaultKeySet)
+  # Iterative decryption attempt
+  $x509 = $null
+  $pfxPath = $null
+  $bytes = $null
+
+  foreach ($file in $candidateFiles) {
+    try {
+      $filePath = if ($file.FullName) { $file.FullName } else { $file }
+      $testBytes = [System.IO.File]::ReadAllBytes($filePath)
+      $testCert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2
+      $testCert.Import($testBytes, $sec, [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::DefaultKeySet)
+      
+      $bytes = $testBytes
+      $x509 = $testCert
+      $pfxPath = $filePath
+      break
+    } catch {
+      Write-Log "Failed parsing candidate $filePath with resolved secret. Trying next candidate..." 'DEBUG'
+    }
+  }
+
+  if (-not $x509) {
+    throw "Found PFX candidates under $certsDir, but none could be decrypted using the resolved secret."
+  }
+
+  if (-not $ReceiveConnectorPattern -or -not $ReceiveConnectorPattern.Trim()) {
+    $ReceiveConnectorPattern = "*Default Frontend $(hostname)*"
+  }
+
   $thumb = $x509.Thumbprint.ToUpperInvariant()
   $cn    = Get-CN -Subject $x509.Subject
   $tlsName = Get-CertTlsName -Cert $x509
-  Write-Log "Thumbprint: $thumb"
-  if ($cn) { Write-Log "Subject CN: $cn" }
+  
+  Write-Log "Selected PFX: $pfxPath"
+  Write-Log "Thumbprint:   $thumb"
+  if ($cn) { Write-Log "Subject CN:   $cn" }
   Write-Log "New TLS name: $tlsName"
 
   # Optional diagnostics pre-flight
@@ -324,8 +339,6 @@ try {
             $msg = if ($res.Access -eq 'OK') { 'OK' } else { "$($res.Access): $($res.Error)" }
             Write-Log ("Diagnostic: Access test for '{0}': {1}" -f $res.Server, $msg) 'DIAG'
           }
-        } else {
-          Write-Log "Diagnostic: No source transport servers enumerated." 'DIAG'
         }
       }
 
@@ -343,8 +356,8 @@ try {
     }
   }
 
-  # Import locally if missing; enable local services
-  $existing = Get-ExchangeCertificate | Where-Object Thumbprint -eq $thumb
+  # Local Import
+  $existing = @(Get-ExchangeCertificate) | Where-Object Thumbprint -eq $thumb
   if (-not $existing) {
     Write-Log "Importing PFX into LocalMachine\My (local)"
     Import-ExchangeCertificate -FileData $bytes -Password $sec -PrivateKeyExportable:$true | Out-Null
@@ -352,9 +365,8 @@ try {
   Write-Log "Enabling services (local): $Services"
   Enable-ExchangeCertificate -Thumbprint $thumb -Services $Services -Force | Out-Null
 
-  # ---- Hybrid & connectors (default: ON) ----
+  # Hybrid & Connectors
   if (-not $NoHybridUpdates) {
-    # Hybrid: set only if different + verify
     try {
       $currentHybrid = $null
       try { $currentHybrid = Get-HybridConfiguration -ErrorAction Stop } catch {}
@@ -369,31 +381,24 @@ try {
         try {
           $post = Get-HybridConfiguration -ErrorAction Stop
           $postVal = if ($post.TlsCertificateName) { $post.TlsCertificateName } else { '<null>' }
-          if ($postVal -ieq $tlsName) {
-            Write-Log "HybridConfiguration verification: updated successfully." 'DEBUG'
-          } else {
-            Write-Log "HybridConfiguration verification: value is '$postVal' (expected '$tlsName')" 'WARN'
-          }
-        } catch { Write-Log "HybridConfiguration verification failed: $($_.Exception.Message)" 'WARN' }
+          if ($postVal -ieq $tlsName) { Write-Log "HybridConfiguration verification successful." 'DEBUG' }
+        } catch {}
       }
     } catch {
       Write-Log "Set-HybridConfiguration failed: $($_.Exception.Message)" 'WARN'
     }
 
-    # Select Send Connectors
+    # Send Connectors
     $sendConnectorsToUpdate = @()
     try {
       if ($AllSendConnectors) {
-        Write-Log "Selecting ALL send connectors"
         $sendConnectorsToUpdate = Get-SendConnector -ErrorAction Stop
       } elseif ($SendConnectorExact -and $SendConnectorExact.Count -gt 0) {
-        Write-Log ("Selecting exact send connectors: {0}" -f ($SendConnectorExact -join ', '))
         foreach ($name in $SendConnectorExact) {
           $sc = Get-SendConnector -Identity $name -ErrorAction Stop
           if ($sc) { $sendConnectorsToUpdate += $sc }
         }
       } else {
-        Write-Log "Selecting send connectors by pattern: $SendConnectorName"
         $sendConnectorsToUpdate = Get-SendConnector $SendConnectorName -ErrorAction Stop
       }
     } catch {
@@ -405,23 +410,12 @@ try {
         $currentTls = $null
         try { $currentTls = $sc.TlsCertificateName } catch {}
 
-        # Resolve source servers
         $srcServers = @()
         try { $srcServers = @($sc.SourceTransportServers) } catch {}
         if (-not $srcServers -or $srcServers.Count -eq 0) { $srcServers = @("$(hostname)") }
 
         Write-Log ("Connector '{0}' sources: {1}" -f $sc.Name, ($srcServers -join ', '))
 
-        # Diagnose remote access per source (optional)
-        if ($Diagnose) {
-          foreach ($srv in $srcServers) {
-            $ar = Test-RemoteExchangeAccess -Server $srv
-            $msg = if ($ar.Access -eq 'OK') { 'OK' } else { "$($ar.Access): $($ar.Error)" }
-            Write-Log ("Diagnostic: Pre-import access test '{0}': {1}" -f $srv, $msg) 'DIAG'
-          }
-        }
-
-        # Ensure cert is present + SMTP enabled on ALL sources via Exchange -Server
         $missing = @()
         foreach ($srv in $srcServers) {
           if (-not (Test-CertPresentOnServer -Server $srv -Thumb $thumb)) {
@@ -430,44 +424,21 @@ try {
             if (-not $ok) { $missing += $srv }
           }
         }
-        # Re-check presence
-        if ($missing.Count -eq 0) {
-          $missing = $srcServers | Where-Object { -not (Test-CertPresentOnServer -Server $_ -Thumb $thumb) }
-        }
 
-        # --- Modified behavior: DO NOT SKIP TLS UPDATE ---
-        if ($missing.Count -gt 0) {
-          Write-Log ("Connector '{0}': still missing cert on: {1}. Proceeding with TLS update (scheduled task will reconcile on each server)." -f $sc.Name, ($missing -join ', ')) 'WARN'
-        }
-
-        # Update TLS name only if different + verify
         if ($currentTls -and ($currentTls -ieq $tlsName)) {
           Write-Log ("Send Connector '{0}': TLS already set. Skipping." -f $sc.Name)
         } else {
           $oldShown = if ($null -ne $currentTls -and $currentTls -ne "") { $currentTls } else { "<null>" }
           Write-Log ("Updating Send Connector '{0}' -TlsCertificateName (old='{1}' -> new='{2}')" -f $sc.Name, $oldShown, $tlsName)
           try { $sc | Set-SendConnector -TlsCertificateName $tlsName -ErrorAction Stop } catch { Write-Log ("Set-SendConnector '{0}' failed: {1}" -f $sc.Name, $_.Exception.Message) 'WARN' }
-          Start-Sleep -Milliseconds 500
-          try {
-            $verify = Get-SendConnector -Identity $sc.Identity -ErrorAction Stop
-            $vVal = if ($verify.TlsCertificateName) { $verify.TlsCertificateName } else { '<null>' }
-            if ($vVal -ieq $tlsName) {
-              Write-Log ("Send Connector '{0}' verification: updated successfully." -f $sc.Name) 'DEBUG'
-            } else {
-              Write-Log ("Send Connector '{0}' verification: value is '{1}' (expected '{2}')" -f $sc.Name, $vVal, $tlsName) 'WARN'
-            }
-          } catch { Write-Log ("Send Connector '{0}' verification failed: {1}" -f $sc.Name, $_.Exception.Message) 'WARN' }
         }
       }
-    } else {
-      Write-Log "No send connectors matched selection; none updated." 'WARN'
     }
 
-    # Receive connectors: update only if different + verify
+    # Receive Connectors
     Write-Log "Checking Receive Connector '$ReceiveConnectorPattern' -TlsCertificateName"
     try {
       $rcs = @(Get-ReceiveConnector $ReceiveConnectorPattern -ErrorAction Stop)
-      if ($rcs.Count -eq 0) { Write-Log "No Receive Connectors matched pattern." 'WARN' }
       foreach ($rc in $rcs) {
         $rcCurrent = $null
         try { $rcCurrent = $rc.TlsCertificateName } catch {}
@@ -477,31 +448,20 @@ try {
           $oldRCShown = if ($null -ne $rcCurrent -and $rcCurrent -ne "") { $rcCurrent } else { "<null>" }
           Write-Log ("Updating Receive Connector '{0}' -TlsCertificateName (old='{1}' -> new='{2}')" -f $rc.Name, $oldRCShown, $tlsName)
           try { $rc | Set-ReceiveConnector -TlsCertificateName $tlsName -ErrorAction Stop } catch { Write-Log ("Set-ReceiveConnector '{0}' failed: {1}" -f $rc.Name, $_.Exception.Message) 'WARN' }
-          Start-Sleep -Milliseconds 500
-          try {
-            $rcv = Get-ReceiveConnector -Identity $rc.Identity -ErrorAction Stop
-            $rVal = if ($rcv.TlsCertificateName) { $rcv.TlsCertificateName } else { '<null>' }
-            if ($rVal -ieq $tlsName) {
-              Write-Log ("Receive Connector '{0}' verification: updated successfully." -f $rc.Name) 'DEBUG'
-            } else {
-              Write-Log ("Receive Connector '{0}' verification: value is '{1}' (expected '{2}')" -f $rc.Name, $rVal, $tlsName) 'WARN'
-            }
-          } catch { Write-Log ("Receive Connector '{0}' verification failed: {1}" -f $rc.Name, $_.Exception.Message) 'WARN' }
         }
       }
     } catch { Write-Log "ReceiveConnector query failed: $($_.Exception.Message)" 'WARN' }
-  } # end Hybrid/connector block
+  }
 
-  # ---- Cleanup old certs (default: ON) ----
+  # Cleanup Old Certs
   if (-not $NoCleanup) {
-    Write-Log "Removing older Exchange certificates that match this certificate (excluding $thumb)"
+    Write-Log "Removing older Exchange certificates matching subject (excluding $thumb)"
     try {
       $exNew = $null
       try { $exNew = Get-ExchangeCertificate -Thumbprint $thumb -ErrorAction Stop } catch {}
       $toRemove = @()
 
       if ($exNew) {
-        # Normalize domains (no wildcard into -DomainName)
         $domains = @()
         if ($exNew.CertificateDomains) {
           $domains = $exNew.CertificateDomains |
@@ -520,16 +480,13 @@ try {
             $toRemove += (Get-ExchangeCertificate | Where-Object { $_.Thumbprint -ne $thumb -and $_.Subject -eq $subj })
           }
         }
-      } else {
-        $subj = $x509.Subject
-        $toRemove += (Get-ExchangeCertificate | Where-Object { $_.Thumbprint -ne $thumb -and $_.Subject -eq $subj })
       }
 
-      $toRemove = $toRemove | Select-Object -Unique
+      $toRemove = @($toRemove | Select-Object -Unique)
       if ($toRemove -and $toRemove.Count -gt 0) {
         Write-Log ("Cleanup: removing {0} older certificate(s)" -f $toRemove.Count)
         $toRemove | ForEach-Object {
-          try { $_ | Remove-ExchangeCertificate -Confirm:$false; Write-Log ("Removed older cert {0} (Subject: {1})" -f $_.Thumbprint, $_.Subject) }
+          try { $_ | Remove-ExchangeCertificate -Confirm:$false; Write-Log ("Removed older cert {0}" -f $_.Thumbprint) }
           catch { Write-Log ("Failed to remove cert {0}: {1}" -f $_.Thumbprint, $_.Exception.Message) 'WARN' }
         }
       } else {
@@ -539,7 +496,7 @@ try {
   }
 
   if ($RestartIIS) {
-    Write-Log "Restarting IIS (optional)"
+    Write-Log "Restarting IIS"
     iisreset /noforce | Out-Null
   }
 
