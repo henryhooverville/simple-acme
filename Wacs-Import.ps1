@@ -4,8 +4,9 @@
 #>
 [CmdletBinding()]
 param(
-  [Parameter(Mandatory=$true)][string]$BaseName = "example.com",
-  [string]$ShareRoot = "\\SHAREROOT\",
+  [Parameter(Mandatory=$false)][string]$ShareRoot = "\\NETWORKDRIVE\Share",
+  [Parameter(Mandatory=$false)][string]$BaseName   = "example.com",
+  
   [string]$PfxOverridePath,
   [string]$SecretsPath,
   [string]$Services = "IIS,SMTP",
