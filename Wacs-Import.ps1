@@ -5,7 +5,7 @@
 [CmdletBinding()]
 param(
   [Parameter(Mandatory=$true)][string]$BaseName = "example.com",
-  [string]$ShareRoot = "C:\CentralSSL",
+  [string]$ShareRoot = "\\SHAREROOT\",
   [string]$PfxOverridePath,
   [string]$SecretsPath,
   [string]$Services = "IIS,SMTP",
